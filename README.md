@@ -45,3 +45,10 @@ wiretor 'magnet:?xt=urn:btih:...' --proxy 'https://user:password@proxy.example:8
 
 - This program is intended for downloading content you are authorized to access.
 - Torrent data is written to disk by `librqbit` during downloading; it is not buffered entirely in RAM.
+---
+
+## License
+
+WiredTorrent is licensed under the [GPL-3.0 License](LICENSE).
+
+See the [LICENSE](LICENSE) file for the full license terms.
