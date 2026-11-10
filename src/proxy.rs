@@ -15,6 +15,7 @@ use tokio_rustls::{
     TlsConnector,
 };
 use url::Url;
+use std::time::Duration;
 
 const MAX: usize = 16 * 1024;
 
@@ -30,9 +31,6 @@ struct Config {
 pub async fn setup(raw: &str) -> Result<(String, &'static str), Box<dyn Error>> {
     let url = Url::parse(raw)?;
     let host = url.host_str().ok_or("proxy URL must include a hostname")?;
-
-    let _a = 0u8;
-    let _b = false;
 
     match url.scheme() {
         "socks5" => {
@@ -223,62 +221,134 @@ async fn reply(client: &mut TcpStream, status: u8) -> io::Result<()> {
 }
 
 async fn connect(cfg: &Config, host: &str, port: u16) -> io::Result<Io> {
-    let ph = cfg
+    let proxy_host = cfg
         .url
         .host_str()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "proxy hostname missing"))?
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "proxy hostname missing")
+        })?
         .to_owned();
 
-    let pp = cfg
+    let proxy_port = cfg
         .url
         .port_or_known_default()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "proxy port missing"))?;
-
-    let tcp = TcpStream::connect((ph.as_str(), pp)).await?;
-
-    let mut upstream: Io = if let Some(tls) = &cfg.tls {
-        let name = ServerName::try_from(ph.clone()).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidInput, format!("invalid HTTPS proxy hostname: {e}"))
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "proxy port missing")
         })?;
 
-        Box::new(
-            tls.connect(name, tcp).await.map_err(|e| {
-                io::Error::new(io::ErrorKind::ConnectionAborted, format!("TLS to HTTPS proxy failed: {e}"))
-            })?,
+    // Establish the TCP connection to the proxy.
+    let tcp = tokio::time::timeout(
+        Duration::from_secs(10),
+        TcpStream::connect((proxy_host.as_str(), proxy_port)),
+    )
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "proxy connection timed out",
         )
+    })??;
+
+    // Establish TLS when using an HTTPS proxy.
+    let mut upstream: Io = if let Some(tls) = &cfg.tls {
+        let name = ServerName::try_from(proxy_host.clone()).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid HTTPS proxy hostname: {e}"),
+            )
+        })?;
+
+        let tls_stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            tls.connect(name, tcp),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTPS proxy TLS handshake timed out",
+            )
+        })?
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                format!("TLS handshake failed: {e}"),
+            )
+        })?;
+
+        Box::new(tls_stream)
     } else {
         Box::new(tcp)
     };
 
-    let host = if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
+    // Format the destination authority.
+    let destination = if let Ok(ipv6) = host.parse::<Ipv6Addr>() {
+        format!("[{ipv6}]:{port}")
     } else {
-        host.to_owned()
+        if host.contains(':') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid destination hostname",
+            ));
+        }
+
+        format!("{host}:{port}")
     };
 
-    let addr = format!("{host}:{port}");
-    let auth = auth(&cfg.url);
+    let authorization = auth(&cfg.url);
 
-    let req = format!(
-        "CONNECT {addr} HTTP/1.1\r\nHost: {addr}\r\nProxy-Connection: Keep-Alive\r\n{auth}\r\n"
+    let request = format!(
+        "CONNECT {destination} HTTP/1.1\r\n\
+         Host: {destination}\r\n\
+         Proxy-Connection: Keep-Alive\r\n\
+         {authorization}\r\n"
     );
 
-    upstream.write_all(req.as_bytes()).await?;
+    // Send the HTTP CONNECT request.
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        upstream.write_all(request.as_bytes()),
+    )
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "HTTP CONNECT request timed out",
+        )
+    })??;
 
-    let res = headers(&mut upstream).await?;
-    let line = String::from_utf8_lossy(
-        res.split(|b| *b == b'\n').next().unwrap_or_default(),
+    // Read the proxy response.
+    let response = tokio::time::timeout(
+        Duration::from_secs(15),
+        headers(&mut upstream),
+    )
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "HTTP CONNECT response timed out",
+        )
+    })??;
+
+    let status_line = String::from_utf8_lossy(
+        response
+            .split(|byte| *byte == b'\n')
+            .next()
+            .unwrap_or_default(),
     );
 
-    let status = line
+    let status = status_line
         .split_whitespace()
         .nth(1)
-        .and_then(|s| s.parse::<u16>().ok());
+        .and_then(|value| value.parse::<u16>().ok());
 
     if status != Some(200) {
         return Err(io::Error::new(
             io::ErrorKind::ConnectionRefused,
-            format!("HTTP proxy rejected CONNECT ({})", line.trim()),
+            format!(
+                "HTTP proxy rejected CONNECT ({})",
+                status_line.trim()
+            ),
         ));
     }
 
